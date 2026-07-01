@@ -1,5 +1,5 @@
 {
-  "name": "@joschka-cesar/cordova-plugin-advanced-http",
+  "name": "@thing-it/cordova-plugin-advanced-http",
   "version": "3.3.2",
   "description": "Cordova / Phonegap plugin for communicating with HTTP servers using SSL pinning",
   "scripts": {
