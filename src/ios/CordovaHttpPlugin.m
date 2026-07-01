@@ -1,4 +1,5 @@
 #import "CordovaHttpPlugin.h"
+#import <Cordova/CDVViewController.h>
 #import "CDVFile.h"
 #import "BinaryRequestSerializer.h"
 #import "BinaryResponseSerializer.h"
