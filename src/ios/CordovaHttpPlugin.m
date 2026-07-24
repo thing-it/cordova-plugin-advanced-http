@@ -34,11 +34,15 @@
 }
 
 - (void)addRequest:(NSNumber*)reqId forTask:(NSURLSessionDataTask*)task {
-    [reqDict setObject:task forKey:reqId];
+    @synchronized (reqDict) {
+        [reqDict setObject:task forKey:reqId];
+    }
 }
 
 - (void)removeRequest:(NSNumber*)reqId {
-    [reqDict removeObjectForKey:reqId];
+    @synchronized (reqDict) {
+        [reqDict removeObjectForKey:reqId];
+    }
 }
 
 - (void)setRequestSerializer:(NSString*)serializerName forManager:(SM_AFHTTPSessionManager*)manager {
@@ -54,6 +58,20 @@
 }
 
 - (void)setupAuthChallengeBlock:(SM_AFHTTPSessionManager*)manager {
+    // Snapshot the security policy and client credential in effect right now so the block
+    // captures and retains its own strong references. The auth challenge block runs on the
+    // NSURLSession delegate queue (a background thread); reading the mutable ivars there while
+    // setServerTrustMode:/setClientAuthMode: reassign them on another thread is a data race that
+    // can leave the block messaging a deallocated policy object (EXC_BAD_ACCESS in
+    // evaluateServerTrust:forDomain:). Capturing local snapshots keeps the objects alive for the
+    // lifetime of the request, regardless of concurrent reassignment.
+    SM_AFSecurityPolicy *policy;
+    NSURLCredential *clientCredential;
+    @synchronized (self) {
+        policy = self->securityPolicy;
+        clientCredential = self->x509Credential;
+    }
+
     [manager setSessionDidReceiveAuthenticationChallengeBlock:^NSURLSessionAuthChallengeDisposition(
         NSURLSession * _Nonnull session,
         NSURLAuthenticationChallenge * _Nonnull challenge,
@@ -62,7 +80,7 @@
         if ([challenge.protectionSpace.authenticationMethod isEqualToString: NSURLAuthenticationMethodServerTrust]) {
             *credential = [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
 
-            if (![self->securityPolicy evaluateServerTrust:challenge.protectionSpace.serverTrust forDomain:challenge.protectionSpace.host]) {
+            if (![policy evaluateServerTrust:challenge.protectionSpace.serverTrust forDomain:challenge.protectionSpace.host]) {
                 return NSURLSessionAuthChallengeRejectProtectionSpace;
             }
 
@@ -71,8 +89,8 @@
             }
         }
 
-        if ([challenge.protectionSpace.authenticationMethod isEqualToString: NSURLAuthenticationMethodClientCertificate] && self->x509Credential) {
-            *credential = self->x509Credential;
+        if ([challenge.protectionSpace.authenticationMethod isEqualToString: NSURLAuthenticationMethodClientCertificate] && clientCredential) {
+            *credential = clientCredential;
             return NSURLSessionAuthChallengeUseCredential;
         }
 
@@ -353,18 +371,30 @@
 - (void)setServerTrustMode:(CDVInvokedUrlCommand*)command {
     NSString *certMode = [command.arguments objectAtIndex:0];
 
+    // Build the new policy on a local first, then swap the ivar inside the lock so the update is
+    // ordered against the snapshot read in setupAuthChallengeBlock:. Reassigning the ivar releases
+    // the previous policy; the lock (plus the snapshot capture) prevents an in-flight auth challenge
+    // block from dereferencing a deallocated policy on the delegate queue.
+    SM_AFSecurityPolicy *newPolicy = nil;
+
     if ([certMode isEqualToString: @"default"] || [certMode isEqualToString: @"legacy"]) {
-        securityPolicy = [SM_AFSecurityPolicy policyWithPinningMode:AFSSLPinningModeNone];
-        securityPolicy.allowInvalidCertificates = NO;
-        securityPolicy.validatesDomainName = YES;
+        newPolicy = [SM_AFSecurityPolicy policyWithPinningMode:AFSSLPinningModeNone];
+        newPolicy.allowInvalidCertificates = NO;
+        newPolicy.validatesDomainName = YES;
     } else if ([certMode isEqualToString: @"nocheck"]) {
-        securityPolicy = [SM_AFSecurityPolicy policyWithPinningMode:AFSSLPinningModeNone];
-        securityPolicy.allowInvalidCertificates = YES;
-        securityPolicy.validatesDomainName = NO;
+        newPolicy = [SM_AFSecurityPolicy policyWithPinningMode:AFSSLPinningModeNone];
+        newPolicy.allowInvalidCertificates = YES;
+        newPolicy.validatesDomainName = NO;
     } else if ([certMode isEqualToString: @"pinned"]) {
-        securityPolicy = [SM_AFSecurityPolicy policyWithPinningMode:AFSSLPinningModeCertificate];
-        securityPolicy.allowInvalidCertificates = NO;
-        securityPolicy.validatesDomainName = YES;
+        newPolicy = [SM_AFSecurityPolicy policyWithPinningMode:AFSSLPinningModeCertificate];
+        newPolicy.allowInvalidCertificates = NO;
+        newPolicy.validatesDomainName = YES;
+    }
+
+    if (newPolicy != nil) {
+        @synchronized (self) {
+            securityPolicy = newPolicy;
+        }
     }
 
     CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
@@ -376,7 +406,9 @@
     NSString *mode = [command.arguments objectAtIndex:0];
 
     if ([mode isEqualToString:@"none"]) {
-      x509Credential = nil;
+      @synchronized (self) {
+        x509Credential = nil;
+      }
       pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
     }
 
@@ -416,7 +448,9 @@
                 }
             }
 
-            self->x509Credential = [NSURLCredential credentialWithIdentity:identity certificates: trustCertificates persistence:NSURLCredentialPersistenceForSession];
+            @synchronized (self) {
+                self->x509Credential = [NSURLCredential credentialWithIdentity:identity certificates: trustCertificates persistence:NSURLCredentialPersistenceForSession];
+            }
             CFRelease(items);
 
             pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
@@ -632,7 +666,10 @@
 
     CDVPluginResult *pluginResult;
     bool removed = false;
-    NSURLSessionDataTask *task = [reqDict objectForKey:reqId];
+    NSURLSessionDataTask *task;
+    @synchronized (reqDict) {
+        task = [reqDict objectForKey:reqId];
+    }
     if(task){
         @try{
             [task cancel];
